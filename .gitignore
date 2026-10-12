@@ -1,0 +1,4 @@
+# Saved sessions contain live login tokens; never commit them
+JagexProfiles/
+Profile_*/
+*.reg
