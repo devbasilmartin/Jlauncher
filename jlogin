@@ -14,6 +14,8 @@
 #   jlogin list                  show saved accounts
 #   jlogin remove <name>         forget an account and its stored password
 #   jlogin desktop <name>        create a one-click menu + desktop icon for <name>
+#   jlogin bind <name> <key>     log in to <name> with a key, e.g. ctrl+alt+1 or F13
+#   jlogin unbind <name>         remove that key
 #   jlogin check                 check that everything needed is installed
 
 set -euo pipefail
@@ -21,6 +23,9 @@ set -euo pipefail
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/jlauncher"
 ACCOUNTS_FILE="$CONFIG_DIR/accounts"
 SETTINGS_FILE="$CONFIG_DIR/settings"
+HOTKEYS_FILE="$CONFIG_DIR/hotkeys"
+XBINDKEYS_RC="$CONFIG_DIR/xbindkeysrc"
+AUTOSTART_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/autostart/jlogin-hotkeys.desktop"
 
 # --- Settings (override any of these in ~/.config/jlauncher/settings) ------------------
 # Command that starts RuneLite. Empty = auto-detect (PATH, ~/RuneLite.AppImage, Flatpak).
@@ -47,6 +52,12 @@ die() {
     fi
     echo "jlogin: $*" >&2
     exit 1
+}
+
+# Progress message; shown as a notification too when started from a hotkey or icon.
+note() {
+    if [[ ! -t 1 ]] && command -v notify-send >/dev/null; then notify-send "jlogin" "$*" || true; fi
+    echo "$*"
 }
 
 need() { command -v "$1" >/dev/null || die "'$1' is not installed. $2"; }
@@ -146,12 +157,17 @@ cmd_remove() {
     awk -F'\t' -v n="$name" '$1 != n' "$ACCOUNTS_FILE" >"$ACCOUNTS_FILE.tmp"
     mv "$ACCOUNTS_FILE.tmp" "$ACCOUNTS_FILE"
     rm -f "$HOME/.local/share/applications/jlogin-$name.desktop"
+    if account_hotkey "$name" >/dev/null; then cmd_unbind "$name" >/dev/null; fi
     echo "Removed '$name'."
 }
 
 cmd_list() {
     if [[ ! -s "$ACCOUNTS_FILE" ]]; then echo "No accounts yet. Add one with: jlogin add <name> <login>"; return; fi
-    awk -F'\t' '{ printf "%-20s %s\n", $1, $2 }' "$ACCOUNTS_FILE"
+    local name login key
+    while IFS=$'\t' read -r name login; do
+        key=$(account_hotkey "$name") || key=""
+        printf '%-20s %-35s %s\n' "$name" "$login" "${key:+key: $key}"
+    done <"$ACCOUNTS_FILE"
 }
 
 cmd_play() {
@@ -161,14 +177,20 @@ cmd_play() {
     need xdotool "Install it with: sudo apt install xdotool"
     need secret-tool "Install it with: sudo apt install libsecret-tools"
     check_display
+    # One login at a time: two would fight over keyboard focus. Also stops a
+    # double-pressed hotkey from opening two windows.
+    mkdir -p "$CONFIG_DIR"
+    exec 9>"$CONFIG_DIR/.play.lock"
+    flock -n 9 || die "Already logging in to an account. Wait for it to finish."
     # Fetch the password before launching, so a locked keyring fails fast.
     pw=$(secret-tool lookup "${SECRET_ATTRS[@]}" "$name") || die "No stored password for '$name' (or the keyring is locked)."
     cmd=$(find_runelite)
 
     before=" $(login_screen_windows | tr '\n' ' ') "
-    echo "Starting RuneLite for '$name'..."
+    note "Starting RuneLite for '$name'..."
     # Start detached so closing RuneLite later doesn't depend on this script.
-    setsid bash -c "$cmd" >/dev/null 2>&1 &
+    # 9>&- keeps RuneLite from inheriting (and holding) the login lock.
+    setsid bash -c "$cmd" >/dev/null 2>&1 9>&- &
 
     win=""
     for ((i = 0; i < WINDOW_TIMEOUT; i++)); do
@@ -194,7 +216,7 @@ cmd_play() {
     printf '%s' "$pw" | type_stdin "$win"
     unset pw
     press "$win" Return
-    echo "Submitted. If the account has an authenticator, type the code in the game window."
+    note "Logged in as '$name'. If it asks for an authenticator code, type it in."
 }
 
 cmd_desktop() {
@@ -227,12 +249,118 @@ EOF
     echo "Added 'RuneLite - $name' to the app menu${desktop_dir:+ and desktop}."
 }
 
+account_hotkey() {
+    [[ -f "$HOTKEYS_FILE" ]] || return 1
+    awk -F'\t' -v n="$1" '$1 == n { print $2; found = 1 } END { exit !found }' "$HOTKEYS_FILE"
+}
+
+# Turn "ctrl+alt+1" / "Super+F9" / "F13" into xbindkeys syntax ("Control+Mod1 + 1").
+# Returns 1 if unreadable, 2 if the key would be unsafe to grab without a modifier.
+xbindkeys_spec() {
+    local parts mods=() key part i
+    IFS=+ read -ra parts <<<"$1"
+    ((${#parts[@]} > 0)) || return 1
+    key=${parts[${#parts[@]} - 1]}
+    [[ "$key" =~ ^[A-Za-z0-9_]+$ ]] || return 1
+    for ((i = 0; i < ${#parts[@]} - 1; i++)); do
+        part=${parts[i],,}
+        case "$part" in
+            ctrl | control) mods+=(Control) ;;
+            alt) mods+=(Mod1) ;;
+            super | win | meta) mods+=(Mod4) ;;
+            shift) mods+=(Shift) ;;
+            *) return 1 ;;
+        esac
+    done
+    # A grabbed key stops reaching every app, including the game (F1-F12 switch tabs
+    # there, letters are chat), so a bare key is only allowed if nothing else uses it.
+    if ((${#mods[@]} == 0)); then
+        [[ "$key" =~ ^(F1[3-9]|F2[0-9]|F3[0-5]|Pause|Scroll_Lock|XF86[A-Za-z0-9]+)$ ]] || return 2
+        echo "$key"
+    else
+        local IFS=+
+        echo "${mods[*]} + $key"
+    fi
+}
+
+# Regenerate the xbindkeys config from the hotkeys file and restart its listener.
+apply_hotkeys() {
+    local self name key
+    self=$(readlink -f "$0")
+    # xbindkeys passes the command to sh without unescaping, so the path is wrapped
+    # in single quotes and must not contain quote characters or backslashes.
+    [[ "$self" != *[\\\"\']* ]] || die "jlogin's path can't contain quotes or backslashes: $self"
+    pkill -u "$(id -u)" -f "xbindkeys -f $XBINDKEYS_RC" 2>/dev/null || true
+
+    if [[ ! -s "$HOTKEYS_FILE" ]]; then
+        rm -f "$XBINDKEYS_RC" "$AUTOSTART_FILE"
+        return
+    fi
+    {
+        echo "# Generated by jlogin from $HOTKEYS_FILE. Change keys with 'jlogin bind/unbind'."
+        while IFS=$'\t' read -r name key; do
+            printf '"'\''%s'\'' play %s"\n    %s\n\n' "$self" "$name" "$(xbindkeys_spec "$key")"
+        done <"$HOTKEYS_FILE"
+    } >"$XBINDKEYS_RC"
+
+    mkdir -p "$(dirname "$AUTOSTART_FILE")"
+    cat >"$AUTOSTART_FILE" <<EOF
+[Desktop Entry]
+Type=Application
+Name=jlogin hotkeys
+Comment=Keys that log in to RuneLite accounts
+Exec=xbindkeys -f "$XBINDKEYS_RC"
+Terminal=false
+X-GNOME-Autostart-enabled=true
+EOF
+
+    if [[ -n "${DISPLAY:-}" ]]; then
+        xbindkeys -f "$XBINDKEYS_RC" ||
+            die "xbindkeys couldn't start. Check the key names with: xbindkeys -f '$XBINDKEYS_RC' -n -v"
+    fi
+}
+
+cmd_bind() {
+    local name=${1:-} key=${2:-} spec rc other k
+    [[ -n "$name" && -n "$key" ]] || die "Usage: jlogin bind <name> <key>   (e.g. ctrl+alt+1, super+F9, F13)"
+    account_login "$name" >/dev/null || die "No account named '$name'."
+    need xbindkeys "Install it with: sudo apt install xbindkeys"
+    rc=0
+    spec=$(xbindkeys_spec "$key") || rc=$?
+    ((rc != 2)) || die "'$key' on its own would stop working in the game and every other app. Add a modifier (e.g. ctrl+alt+$key) or use F13-F24."
+    ((rc == 0)) || die "Can't read key '$key'. Use forms like ctrl+alt+1, super+F9, shift+ctrl+m or F13."
+
+    if [[ -f "$HOTKEYS_FILE" ]]; then
+        while IFS=$'\t' read -r other k; do
+            if [[ "$other" != "$name" && "$(xbindkeys_spec "$k")" == "$spec" ]]; then
+                die "That key is already used by '$other'."
+            fi
+        done <"$HOTKEYS_FILE"
+        awk -F'\t' -v n="$name" '$1 != n' "$HOTKEYS_FILE" >"$HOTKEYS_FILE.tmp"
+        mv "$HOTKEYS_FILE.tmp" "$HOTKEYS_FILE"
+    fi
+    printf '%s\t%s\n' "$name" "$key" >>"$HOTKEYS_FILE"
+    apply_hotkeys
+    echo "Pressing $key now logs in to '$name'. It keeps working after a restart."
+}
+
+cmd_unbind() {
+    local name=${1:-}
+    [[ -n "$name" ]] || die "Usage: jlogin unbind <name>"
+    account_hotkey "$name" >/dev/null || die "'$name' has no key."
+    awk -F'\t' -v n="$name" '$1 != n' "$HOTKEYS_FILE" >"$HOTKEYS_FILE.tmp"
+    mv "$HOTKEYS_FILE.tmp" "$HOTKEYS_FILE"
+    apply_hotkeys
+    echo "Removed the key for '$name'."
+}
+
 cmd_check() {
     local ok=1 cmd
     for t in xdotool secret-tool; do
         if command -v "$t" >/dev/null; then echo "[ok]      $t"; else echo "[missing] $t"; ok=0; fi
     done
-    if command -v notify-send >/dev/null; then echo "[ok]      notify-send"; else echo "[optional] notify-send (error pop-ups for desktop icons)"; fi
+    if command -v notify-send >/dev/null; then echo "[ok]      notify-send"; else echo "[optional] notify-send (pop-up messages for icons and keys)"; fi
+    if command -v xbindkeys >/dev/null; then echo "[ok]      xbindkeys"; else echo "[optional] xbindkeys (needed for 'jlogin bind')"; fi
     echo "[info]    session type: ${XDG_SESSION_TYPE:-unknown} (needs x11)"
     if cmd=$( (find_runelite) 2>/dev/null); then echo "[ok]      RuneLite: $cmd"; else echo "[missing] RuneLite"; ok=0; fi
     if ((ok)); then echo "Ready."; else echo "Install what's missing: sudo apt install xdotool libsecret-tools"; return 1; fi
@@ -244,6 +372,8 @@ case "${1:-}" in
     list) cmd_list ;;
     remove) shift; cmd_remove "$@" ;;
     desktop) shift; cmd_desktop "$@" ;;
+    bind) shift; cmd_bind "$@" ;;
+    unbind) shift; cmd_unbind "$@" ;;
     check) cmd_check ;;
     *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 1 ;;
 esac

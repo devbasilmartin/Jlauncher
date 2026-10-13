@@ -84,14 +84,14 @@ After changing the paths, test with two accounts: switch back and forth a few ti
 
 `jlogin` opens a **new** RuneLite window and types a legacy account's login and password into its login screen. It's meant for players who find typing credentials hard.
 
-> **Read this first.** Jagex can treat any program that types into the game client as macroing, even on the login screen. Using `jlogin` is a risk to the accounts you use it with, and that's your decision to make. To keep the risk as low as possible, it does exactly one login per click you make. It never runs on its own, and it never sends input once you're in the game.
+> **Read this first.** Jagex can treat any program that types into the game client as macroing, even on the login screen. Using `jlogin` is a risk to the accounts you use it with, and that's your decision to make. To keep the risk as low as possible, it does exactly one login per click or key press. It never runs on its own, and it never sends input once you're in the game.
 
 ### Setup (inside the Linux VM)
 
 1. **Use an X11 session.** `xdotool` can't type into windows under Wayland. On the desktop's login screen, choose the session named "Xorg" or "X11".
 2. **Install the tools:**
    ```bash
-   sudo apt install xdotool libsecret-tools libnotify-bin
+   sudo apt install xdotool libsecret-tools libnotify-bin xbindkeys
    ```
    You also need RuneLite. The script finds `runelite` on your PATH, `~/RuneLite.AppImage`, or the Flatpak `net.runelite.RuneLite` automatically.
 3. **Install the script and check it:**
@@ -110,11 +110,17 @@ After changing the paths, test with two accounts: switch back and forth a few ti
    jlogin desktop Skiller
    ```
    This adds **RuneLite - Main** and similar icons to the app menu and the desktop. If an icon errors, a notification explains what went wrong.
+6. **Or give each account a key** (see [Hotkeys](#hotkeys)):
+   ```bash
+   jlogin bind Main ctrl+alt+1
+   jlogin bind Skiller ctrl+alt+2
+   ```
 
 ### Everyday use
 
-- **Log in:** click an account's icon. RuneLite opens, and about 20 seconds later the login is filled in and submitted. If the account has an authenticator, type the 6-digit code yourself.
-- **Switch accounts:** close the RuneLite window, then click another icon. You can also keep several windows open, one per account.
+- **Log in:** click an account's icon or press its key. RuneLite opens, and about 20 seconds later the login is filled in and submitted. If the account has an authenticator, type the 6-digit code yourself.
+- **Switch accounts:** close the RuneLite window, then click another icon or press another key. You can also keep several windows open, one per account.
+- **One login at a time.** Pressing a key again, or another account's key, while a login is in progress does nothing. A pop-up says to wait.
 - **Hands off while it types.** If another window takes focus, `jlogin` stops immediately instead of typing into it.
 
 ### Commands
@@ -126,7 +132,24 @@ After changing the paths, test with two accounts: switch back and forth a few ti
 | `jlogin list` | Show saved accounts |
 | `jlogin remove <name>` | Forget an account, its stored password, and its menu icon |
 | `jlogin desktop <name>` | Create a one-click icon |
+| `jlogin bind <name> <key>` | Log in to `<name>` when `<key>` is pressed |
+| `jlogin unbind <name>` | Remove an account's key |
 | `jlogin check` | Check that the required tools and RuneLite are found |
+
+### Hotkeys
+
+`jlogin bind` sets a key per account. The keys work in any app, start automatically when you log in to the desktop, and keep working after a restart.
+
+- **Key format:** `ctrl+alt+1`, `super+F9`, `shift+ctrl+m`. Modifiers are `ctrl`, `alt`, `shift` and `super` (the Windows key).
+- **Keys on their own are mostly refused.** A key bound with no modifier stops reaching every app, so binding `F5` would break that tab key in the game, and binding a letter would break chat. On their own, only `F13`-`F24`, `Pause` and `Scroll_Lock` are allowed.
+- **Accessibility switches and big-button keypads:** most can be programmed to send a key. Set each button to `F13`, `F14` and so on. Nothing else uses those keys, so they're the safest choice:
+  ```bash
+  jlogin bind Main F13
+  jlogin bind Skiller F14
+  ```
+- **Checking:** `jlogin list` shows each account's key.
+
+`jlogin` uses `xbindkeys` with its own config file, so it doesn't interfere with keys you've set up elsewhere.
 
 ### Safety design
 
