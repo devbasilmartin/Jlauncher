@@ -1,10 +1,19 @@
-# Jlauncher: Jagex Launcher profile switcher
+# Jlauncher
+
+Two tools for playing several RuneScape accounts:
+
+- **[`JagexProfiles.ps1`](#windows-jagex-launcher-profile-switcher)** (Windows): switches the official Jagex Launcher between Jagex accounts.
+- **[`jlogin`](#linux-one-click-login-for-legacy-accounts)** (Linux): opens RuneLite and logs in to a legacy (non-Jagex) account in one click.
+
+On Linux, use [Bolt](https://bolt.adamcake.com/) for Jagex accounts. It stays signed in to all of them and launches RuneLite.
+
+## Windows: Jagex Launcher profile switcher
 
 Switch the Jagex Launcher between several Jagex accounts in one click, without signing in again each time.
 
 The Jagex Launcher stores only **one** signed-in session per Windows user. `JagexProfiles.ps1` saves that session into a named profile and restores another one while the launcher is closed. It doesn't automate gameplay, type passwords, or contact Jagex servers. It only moves the launcher's own local files.
 
-## Quick start
+### Quick start
 
 1. Put `JagexProfiles.ps1` somewhere permanent, such as `C:\Tools\Jlauncher\`.
 2. Open PowerShell in that folder and check the paths on your PC:
@@ -28,7 +37,7 @@ The Jagex Launcher stores only **one** signed-in session per Windows user. `Jage
    ```
    Double-clicking **Jagex - Ironman** closes the launcher, saves the active account, swaps in Ironman, and reopens the launcher. If anything goes wrong, a pop-up explains what happened.
 
-## Commands
+### Commands
 
 | Command | What it does |
 |---|---|
@@ -42,7 +51,7 @@ The Jagex Launcher stores only **one** signed-in session per Windows user. `Jage
 
 Options: `-NoLaunch` swaps without opening the launcher. `-Discard` lets `switch` or `new` throw away a session that isn't saved to any profile.
 
-## Safety design
+### Safety design
 
 - **No mixing between accounts.** The live folders and registry key are fully cleared before a profile is restored. Copying over the top would leave the previous account's files behind.
 - **Never overwrites an unknown session.** If the live session isn't recorded as belonging to a profile, `switch` and `new` refuse to run until you `save` it, or until you pass `-Discard`.
@@ -52,7 +61,7 @@ Options: `-NoLaunch` swaps without opening the launcher. `-Discard` lets `switch
 
 > **Treat `%LOCALAPPDATA%\JagexProfiles` like a password vault.** Each profile contains live sign-in tokens. Anyone who copies that folder may be able to use your accounts. Don't upload it, sync it, or back it up anywhere you don't fully control. If a copy leaks, sign out of all sessions from each account's Jagex account settings page.
 
-## Configuration
+### Configuration
 
 The paths are at the top of the script:
 
@@ -66,7 +75,74 @@ If `discover` shows the launcher keeps its data somewhere else, edit `$SessionDi
 
 After changing the paths, test with two accounts: switch back and forth a few times and confirm each one opens signed in.
 
-## Alternatives
+### Alternatives
 
 - **[Bolt Launcher](https://bolt.adamcake.com/)** is a free, open-source third-party launcher. It can stay signed in to several Jagex accounts at once.
 - **RuneLite only:** RuneLite's [Jagex account guide](https://github.com/runelite/runelite/wiki/Using-Jagex-Accounts) explains `--insecure-write-credentials`, which saves a credentials file for RuneLite to use without the launcher. You can keep one such file per account.
+
+## Linux: one-click login for legacy accounts
+
+`jlogin` opens a **new** RuneLite window and types a legacy account's login and password into its login screen. It's meant for players who find typing credentials hard.
+
+> **Read this first.** Jagex can treat any program that types into the game client as macroing, even on the login screen. Using `jlogin` is a risk to the accounts you use it with, and that's your decision to make. To keep the risk as low as possible, it does exactly one login per click you make. It never runs on its own, and it never sends input once you're in the game.
+
+### Setup (inside the Linux VM)
+
+1. **Use an X11 session.** `xdotool` can't type into windows under Wayland. On the desktop's login screen, choose the session named "Xorg" or "X11".
+2. **Install the tools:**
+   ```bash
+   sudo apt install xdotool libsecret-tools libnotify-bin
+   ```
+   You also need RuneLite. The script finds `runelite` on your PATH, `~/RuneLite.AppImage`, or the Flatpak `net.runelite.RuneLite` automatically.
+3. **Install the script and check it:**
+   ```bash
+   install -m 755 jlogin ~/.local/bin/jlogin
+   jlogin check
+   ```
+4. **Add each account.** The password goes into the desktop keyring (GNOME Keyring or KWallet), never into a file:
+   ```bash
+   jlogin add Main main@example.com
+   jlogin add Skiller skiller@example.com
+   ```
+5. **Make one-click icons:**
+   ```bash
+   jlogin desktop Main
+   jlogin desktop Skiller
+   ```
+   This adds **RuneLite - Main** and similar icons to the app menu and the desktop. If an icon errors, a notification explains what went wrong.
+
+### Everyday use
+
+- **Log in:** click an account's icon. RuneLite opens, and about 20 seconds later the login is filled in and submitted. If the account has an authenticator, type the 6-digit code yourself.
+- **Switch accounts:** close the RuneLite window, then click another icon. You can also keep several windows open, one per account.
+- **Hands off while it types.** If another window takes focus, `jlogin` stops immediately instead of typing into it.
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `jlogin add <name> <login>` | Save an account (asks for the password twice) |
+| `jlogin play <name>` | Open RuneLite and log in |
+| `jlogin list` | Show saved accounts |
+| `jlogin remove <name>` | Forget an account, its stored password, and its menu icon |
+| `jlogin desktop <name>` | Create a one-click icon |
+| `jlogin check` | Check that the required tools and RuneLite are found |
+
+### Safety design
+
+- **Only fresh windows.** It types only into a RuneLite window it just opened. It identifies the window by its title, which is `RuneLite` at the login screen and `RuneLite - <name>` in game.
+- **Checks before every step.** Before each piece of typing it confirms the window still has focus and is still at the login screen. Otherwise it stops, so a password can't end up in game chat or another app.
+- **Passwords stay hidden.** Passwords come from the keyring at the moment of login and are passed to `xdotool` through a pipe, so they never appear in the process list.
+- **No authenticator automation.** It never stores or types authenticator codes.
+
+### Tuning
+
+If logins don't go through, create `~/.config/jlauncher/settings` and adjust:
+
+```bash
+LOAD_WAIT=30      # seconds for RuneLite to reach the login screen (raise on slow VMs)
+KEY_DELAY=120     # milliseconds between keys (raise if characters go missing)
+RUNELITE_CMD="$HOME/Apps/RuneLite.AppImage"   # if RuneLite isn't found automatically
+```
+
+The login sequence is: Enter (Existing User), clear the field, type the login, Tab, clear the field, type the password, Enter. Leave **Remember username** unticked on the game's login screen. If it's ticked, the cursor starts in the password field and the sequence types into the wrong fields.

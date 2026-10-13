@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# jlogin: one-click login for legacy (non-Jagex) RuneScape accounts in RuneLite on Linux.
+#
+# Each "play" opens a NEW RuneLite window for that account and types the username and
+# password into its login screen. It never clicks or types once you are in the game.
+# To switch accounts, close the window (or keep several open).
+#
+# Passwords live in the desktop's secret store (GNOME Keyring / KWallet via libsecret),
+# never in a file. The authenticator code is always typed by hand.
+#
+# Usage:
+#   jlogin add <name> <login>    save an account (prompts for the password)
+#   jlogin play <name>           open RuneLite and log in
+#   jlogin list                  show saved accounts
+#   jlogin remove <name>         forget an account and its stored password
+#   jlogin desktop <name>        create a one-click menu + desktop icon for <name>
+#   jlogin check                 check that everything needed is installed
+
+set -euo pipefail
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/jlauncher"
+ACCOUNTS_FILE="$CONFIG_DIR/accounts"
+SETTINGS_FILE="$CONFIG_DIR/settings"
+
+# --- Settings (override any of these in ~/.config/jlauncher/settings) ------------------
+# Command that starts RuneLite. Empty = auto-detect (PATH, ~/RuneLite.AppImage, Flatpak).
+RUNELITE_CMD=""
+# Seconds to wait after the window appears, for the client to reach its login screen.
+LOAD_WAIT=20
+# Max seconds to wait for the RuneLite window to appear at all.
+WINDOW_TIMEOUT=120
+# Milliseconds between simulated key presses (Java clients drop keys if this is too low).
+KEY_DELAY=80
+# Backspaces sent to empty a login field before typing into it.
+CLEAR_KEYS=40
+# -------------------------------------------------------------------------------------
+
+# shellcheck source=/dev/null
+[[ -f "$SETTINGS_FILE" ]] && source "$SETTINGS_FILE"
+
+SECRET_ATTRS=(service jlauncher account)
+
+die() {
+    # Desktop shortcuts have no terminal, so also show errors as a notification.
+    if [[ ! -t 2 ]] && command -v notify-send >/dev/null; then
+        notify-send -u critical "jlogin" "$*" || true
+    fi
+    echo "jlogin: $*" >&2
+    exit 1
+}
+
+need() { command -v "$1" >/dev/null || die "'$1' is not installed. $2"; }
+
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]{1,40}$ ]] || die "Account names may only use letters, digits, '_' and '-' (max 40)."
+}
+
+account_login() {
+    [[ -f "$ACCOUNTS_FILE" ]] || return 1
+    awk -F'\t' -v n="$1" '$1 == n { print $2; found = 1 } END { exit !found }' "$ACCOUNTS_FILE"
+}
+
+find_runelite() {
+    if [[ -n "$RUNELITE_CMD" ]]; then echo "$RUNELITE_CMD"; return; fi
+    if command -v runelite >/dev/null; then echo "runelite"; return; fi
+    for f in "$HOME/RuneLite.AppImage" "$HOME/Applications/RuneLite.AppImage" "$HOME/Downloads/RuneLite.AppImage"; do
+        if [[ -x "$f" ]]; then printf '%q\n' "$f"; return; fi
+    done
+    if command -v flatpak >/dev/null && flatpak info net.runelite.RuneLite >/dev/null 2>&1; then
+        echo "flatpak run net.runelite.RuneLite"; return
+    fi
+    die "RuneLite not found. Set RUNELITE_CMD in $SETTINGS_FILE."
+}
+
+check_display() {
+    [[ -n "${DISPLAY:-}" ]] || die "No X display. jlogin must run inside the desktop session."
+    if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]]; then
+        die "This is a Wayland session; xdotool can't type into windows there. Log out and pick an 'X11'/'Xorg' session at the login screen."
+    fi
+}
+
+# RuneLite windows whose title says they are at the login screen ("RuneLite", maybe with a
+# version) rather than in game ("RuneLite - PlayerName") or the updater ("RuneLite Launcher").
+login_screen_windows() {
+    local id title
+    for id in $(xdotool search --onlyvisible --name '^RuneLite' 2>/dev/null); do
+        title=$(xdotool getwindowname "$id" 2>/dev/null) || continue
+        [[ "$title" == *Launcher* || "$title" == *" - "* ]] && continue
+        echo "$id"
+    done
+}
+
+# Focus $1 and confirm it is still a RuneLite login-screen window that has focus.
+# Called right before every bit of typing so keys can never land in another app or in chat.
+ensure_target() {
+    local win=$1 title
+    title=$(xdotool getwindowname "$win" 2>/dev/null) || die "The RuneLite window closed."
+    [[ "$title" == RuneLite* && "$title" != *" - "* && "$title" != *Launcher* ]] ||
+        die "Stopped: the window is no longer at the login screen (title: '$title')."
+    xdotool windowactivate --sync "$win" 2>/dev/null || xdotool windowfocus --sync "$win"
+    sleep 0.3
+    [[ "$(xdotool getwindowfocus)" == "$win" || "$(xdotool getactivewindow 2>/dev/null)" == "$win" ]] ||
+        die "Stopped: another window took focus. Nothing more was typed."
+}
+
+press() { ensure_target "$1"; shift; xdotool key --clearmodifiers --delay "$KEY_DELAY" "$@"; }
+
+# Type text from stdin so it never shows up in the process list.
+type_stdin() { ensure_target "$1"; xdotool type --clearmodifiers --delay "$KEY_DELAY" --file -; }
+
+clear_field() {
+    local keys=()
+    for ((i = 0; i < CLEAR_KEYS; i++)); do keys+=(BackSpace); done
+    press "$1" "${keys[@]}"
+}
+
+cmd_add() {
+    local name=${1:-} login=${2:-}
+    [[ -n "$name" && -n "$login" ]] || die "Usage: jlogin add <name> <login email or username>"
+    valid_name "$name"
+    [[ "$login" != *$'\t'* && "$login" != *$'\n'* ]] || die "The login can't contain tabs or newlines."
+    need secret-tool "Install it with: sudo apt install libsecret-tools"
+    account_login "$name" >/dev/null && die "Account '$name' already exists. Remove it first to change it."
+
+    local pw pw2
+    read -rsp "Password for $login: " pw; echo
+    read -rsp "Repeat password: " pw2; echo
+    [[ -n "$pw" ]] || die "Empty password."
+    [[ "$pw" == "$pw2" ]] || die "Passwords don't match."
+    printf '%s' "$pw" | secret-tool store --label="jlogin: $name" "${SECRET_ATTRS[@]}" "$name" ||
+        die "Couldn't save to the secret store. Is GNOME Keyring or KWallet running?"
+    unset pw pw2
+
+    mkdir -p "$CONFIG_DIR"
+    chmod 700 "$CONFIG_DIR"
+    printf '%s\t%s\n' "$name" "$login" >>"$ACCOUNTS_FILE"
+    chmod 600 "$ACCOUNTS_FILE"
+    echo "Saved '$name'. Log in with: jlogin play $name"
+}
+
+cmd_remove() {
+    local name=${1:-}
+    [[ -n "$name" ]] || die "Usage: jlogin remove <name>"
+    account_login "$name" >/dev/null || die "No account named '$name'."
+    secret-tool clear "${SECRET_ATTRS[@]}" "$name" || true
+    awk -F'\t' -v n="$name" '$1 != n' "$ACCOUNTS_FILE" >"$ACCOUNTS_FILE.tmp"
+    mv "$ACCOUNTS_FILE.tmp" "$ACCOUNTS_FILE"
+    rm -f "$HOME/.local/share/applications/jlogin-$name.desktop"
+    echo "Removed '$name'."
+}
+
+cmd_list() {
+    if [[ ! -s "$ACCOUNTS_FILE" ]]; then echo "No accounts yet. Add one with: jlogin add <name> <login>"; return; fi
+    awk -F'\t' '{ printf "%-20s %s\n", $1, $2 }' "$ACCOUNTS_FILE"
+}
+
+cmd_play() {
+    local name=${1:-} login pw cmd win before i
+    [[ -n "$name" ]] || die "Usage: jlogin play <name>"
+    login=$(account_login "$name") || die "No account named '$name'. See: jlogin list"
+    need xdotool "Install it with: sudo apt install xdotool"
+    need secret-tool "Install it with: sudo apt install libsecret-tools"
+    check_display
+    # Fetch the password before launching, so a locked keyring fails fast.
+    pw=$(secret-tool lookup "${SECRET_ATTRS[@]}" "$name") || die "No stored password for '$name' (or the keyring is locked)."
+    cmd=$(find_runelite)
+
+    before=" $(login_screen_windows | tr '\n' ' ') "
+    echo "Starting RuneLite for '$name'..."
+    # Start detached so closing RuneLite later doesn't depend on this script.
+    setsid bash -c "$cmd" >/dev/null 2>&1 &
+
+    win=""
+    for ((i = 0; i < WINDOW_TIMEOUT; i++)); do
+        for id in $(login_screen_windows); do
+            [[ "$before" == *" $id "* ]] && continue
+            win=$id; break
+        done
+        [[ -n "$win" ]] && break
+        sleep 1
+    done
+    [[ -n "$win" ]] || die "RuneLite's window didn't appear within ${WINDOW_TIMEOUT}s."
+
+    echo "Waiting ${LOAD_WAIT}s for the login screen..."
+    sleep "$LOAD_WAIT"
+
+    # Welcome screen -> "Existing User" (Enter), then fill both fields and submit.
+    press "$win" Return
+    sleep 1
+    clear_field "$win"
+    printf '%s' "$login" | type_stdin "$win"
+    press "$win" Tab
+    clear_field "$win"
+    printf '%s' "$pw" | type_stdin "$win"
+    unset pw
+    press "$win" Return
+    echo "Submitted. If the account has an authenticator, type the code in the game window."
+}
+
+cmd_desktop() {
+    local name=${1:-} self apps desktop_dir file
+    [[ -n "$name" ]] || die "Usage: jlogin desktop <name>"
+    account_login "$name" >/dev/null || die "No account named '$name'."
+    self=$(readlink -f "$0")
+    apps="$HOME/.local/share/applications"
+    file="$apps/jlogin-$name.desktop"
+    mkdir -p "$apps"
+    cat >"$file" <<EOF
+[Desktop Entry]
+Type=Application
+Name=RuneLite - $name
+Comment=Open RuneLite and log in as $name
+Exec="$self" play $name
+Icon=runelite
+Terminal=false
+Categories=Game;
+EOF
+    chmod +x "$file"
+    desktop_dir=$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")
+    if [[ -d "$desktop_dir" ]]; then
+        cp "$file" "$desktop_dir/"
+        chmod +x "$desktop_dir/jlogin-$name.desktop"
+        if command -v gio >/dev/null; then
+            gio set "$desktop_dir/jlogin-$name.desktop" metadata::trusted true 2>/dev/null || true
+        fi
+    fi
+    echo "Added 'RuneLite - $name' to the app menu${desktop_dir:+ and desktop}."
+}
+
+cmd_check() {
+    local ok=1 cmd
+    for t in xdotool secret-tool; do
+        if command -v "$t" >/dev/null; then echo "[ok]      $t"; else echo "[missing] $t"; ok=0; fi
+    done
+    if command -v notify-send >/dev/null; then echo "[ok]      notify-send"; else echo "[optional] notify-send (error pop-ups for desktop icons)"; fi
+    echo "[info]    session type: ${XDG_SESSION_TYPE:-unknown} (needs x11)"
+    if cmd=$( (find_runelite) 2>/dev/null); then echo "[ok]      RuneLite: $cmd"; else echo "[missing] RuneLite"; ok=0; fi
+    if ((ok)); then echo "Ready."; else echo "Install what's missing: sudo apt install xdotool libsecret-tools"; return 1; fi
+}
+
+case "${1:-}" in
+    add) shift; cmd_add "$@" ;;
+    play) shift; cmd_play "$@" ;;
+    list) cmd_list ;;
+    remove) shift; cmd_remove "$@" ;;
+    desktop) shift; cmd_desktop "$@" ;;
+    check) cmd_check ;;
+    *) sed -n '2,/^$/s/^# \{0,1\}//p' "$0"; exit 1 ;;
+esac
